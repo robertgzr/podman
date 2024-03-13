@@ -31,6 +31,8 @@ import (
 	"github.com/containers/podman/v5/pkg/domain/infra/abi/internal/expansion"
 	v1apps "github.com/containers/podman/v5/pkg/k8s.io/api/apps/v1"
 	v1 "github.com/containers/podman/v5/pkg/k8s.io/api/core/v1"
+	"github.com/containers/podman/v5/pkg/k8s.io/api/resource"
+	v1alpha2resource "github.com/containers/podman/v5/pkg/k8s.io/api/resource/v1alpha2"
 	metav1 "github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/apis/meta/v1"
 	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/containers/podman/v5/pkg/specgen/generate"
@@ -42,6 +44,7 @@ import (
 	"github.com/containers/storage/pkg/fileutils"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
 	yamlv3 "gopkg.in/yaml.v3"
@@ -239,6 +242,12 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 	if options.ServiceContainer && options.Start == types.OptionalBoolFalse { // Sanity check to be future proof
 		return nil, fmt.Errorf("running a service container requires starting the pod(s)")
 	}
+	var (
+		configMaps           []v1.ConfigMap
+		dynamicDeviceManager resource.DynamicResourcesManager
+	)
+
+	dynamicDeviceManager = resource.NewDynamicDevicesResourceManager()
 
 	report := &entities.PlayKubeReport{}
 	validKinds := 0
@@ -279,8 +288,6 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 	}
 
 	ipIndex := 0
-
-	var configMaps []v1.ConfigMap
 
 	ranContainers := false
 	// FIXME: both, the service container and the proxies, should ideally
@@ -356,7 +363,7 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 				return nil, err
 			}
 
-			r, proxies, err := ic.playKubePod(ctx, podTemplateSpec.ObjectMeta.Name, &podTemplateSpec, options, &ipIndex, podYAML.Annotations, configMaps, serviceContainer)
+			r, proxies, err := ic.playKubePod(ctx, podTemplateSpec.ObjectMeta.Name, &podTemplateSpec, options, &ipIndex, podYAML.Annotations, configMaps, dynamicDeviceManager, serviceContainer)
 			if err != nil {
 				return nil, err
 			}
@@ -372,7 +379,7 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 				return nil, fmt.Errorf("unable to read YAML as Kube DaemonSet: %w", err)
 			}
 
-			r, proxies, err := ic.playKubeDaemonSet(ctx, &daemonSetYAML, options, &ipIndex, configMaps, serviceContainer)
+			r, proxies, err := ic.playKubeDaemonSet(ctx, &daemonSetYAML, options, &ipIndex, configMaps, dynamicDeviceManager, serviceContainer)
 			if err != nil {
 				return nil, err
 			}
@@ -388,7 +395,7 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 				return nil, fmt.Errorf("unable to read YAML as Kube Deployment: %w", err)
 			}
 
-			r, proxies, err := ic.playKubeDeployment(ctx, &deploymentYAML, options, &ipIndex, configMaps, serviceContainer)
+			r, proxies, err := ic.playKubeDeployment(ctx, &deploymentYAML, options, &ipIndex, configMaps, dynamicDeviceManager, serviceContainer)
 			if err != nil {
 				return nil, err
 			}
@@ -404,7 +411,7 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 				return nil, fmt.Errorf("unable to read YAML as Kube Job: %w", err)
 			}
 
-			r, proxies, err := ic.playKubeJob(ctx, &jobYAML, options, &ipIndex, configMaps, serviceContainer)
+			r, proxies, err := ic.playKubeJob(ctx, &jobYAML, options, &ipIndex, configMaps, dynamicDeviceManager, serviceContainer)
 			if err != nil {
 				return nil, err
 			}
@@ -460,6 +467,19 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 			}
 			report.Secrets = append(report.Secrets, entities.PlaySecret{CreateReport: r})
 			validKinds++
+		case v1alpha2resource.ClaimParametersKind:
+			var claimParameters resource.ClaimParameters
+			if err := yaml.Unmarshal(document, &claimParameters); err != nil {
+				return nil, fmt.Errorf("unable to read YAML as Kube ClaimParameters: %w", err)
+			}
+			fmt.Printf("CLAIM PARAMS\n\n\n%v\n\n\n", claimParameters)
+			dynamicDeviceManager.AddClaimParameters(claimParameters)
+		case v1alpha2resource.ResourceClaimTemplateKind:
+			var resourceClaimTemplate v1alpha2resource.ResourceClaim
+			if err := yaml.Unmarshal(document, &resourceClaimTemplate); err != nil {
+				return nil, fmt.Errorf("unable to read YAML as Kube ResourceClaimTemplate: %w", err)
+			}
+			dynamicDeviceManager.AddResourceClaimTemplate(resourceClaimTemplate)
 		default:
 			logrus.Infof("Kube kind %s not supported", kind)
 			continue
@@ -514,7 +534,7 @@ func (ic *ContainerEngine) PlayKube(ctx context.Context, body io.Reader, options
 	return report, nil
 }
 
-func (ic *ContainerEngine) playKubeDaemonSet(ctx context.Context, daemonSetYAML *v1apps.DaemonSet, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
+func (ic *ContainerEngine) playKubeDaemonSet(ctx context.Context, daemonSetYAML *v1apps.DaemonSet, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, dm resource.DynamicResourcesManager, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
 	var (
 		daemonSetName string
 		podSpec       v1.PodTemplateSpec
@@ -528,7 +548,7 @@ func (ic *ContainerEngine) playKubeDaemonSet(ctx context.Context, daemonSetYAML 
 	podSpec = daemonSetYAML.Spec.Template
 
 	podName := fmt.Sprintf("%s-pod", daemonSetName)
-	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, daemonSetYAML.Annotations, configMaps, serviceContainer)
+	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, daemonSetYAML.Annotations, configMaps, dm, serviceContainer)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encountered while bringing up pod %s: %w", podName, err)
 	}
@@ -537,7 +557,7 @@ func (ic *ContainerEngine) playKubeDaemonSet(ctx context.Context, daemonSetYAML 
 	return &report, proxies, nil
 }
 
-func (ic *ContainerEngine) playKubeDeployment(ctx context.Context, deploymentYAML *v1apps.Deployment, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
+func (ic *ContainerEngine) playKubeDeployment(ctx context.Context, deploymentYAML *v1apps.Deployment, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, dm resource.DynamicResourcesManager, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
 	var (
 		deploymentName string
 		podSpec        v1.PodTemplateSpec
@@ -559,7 +579,7 @@ func (ic *ContainerEngine) playKubeDeployment(ctx context.Context, deploymentYAM
 	podSpec = deploymentYAML.Spec.Template
 
 	podName := fmt.Sprintf("%s-pod", deploymentName)
-	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, deploymentYAML.Annotations, configMaps, serviceContainer)
+	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, deploymentYAML.Annotations, configMaps, dm, serviceContainer)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encountered while bringing up pod %s: %w", podName, err)
 	}
@@ -568,7 +588,7 @@ func (ic *ContainerEngine) playKubeDeployment(ctx context.Context, deploymentYAM
 	return &report, proxies, nil
 }
 
-func (ic *ContainerEngine) playKubeJob(ctx context.Context, jobYAML *v1.Job, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
+func (ic *ContainerEngine) playKubeJob(ctx context.Context, jobYAML *v1.Job, options entities.PlayKubeOptions, ipIndex *int, configMaps []v1.ConfigMap, dm resource.DynamicResourcesManager, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
 	var (
 		jobName string
 		podSpec v1.PodTemplateSpec
@@ -582,7 +602,7 @@ func (ic *ContainerEngine) playKubeJob(ctx context.Context, jobYAML *v1.Job, opt
 	podSpec = jobYAML.Spec.Template
 
 	podName := fmt.Sprintf("%s-pod", jobName)
-	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, jobYAML.Annotations, configMaps, serviceContainer)
+	podReport, proxies, err := ic.playKubePod(ctx, podName, &podSpec, options, ipIndex, jobYAML.Annotations, configMaps, dm, serviceContainer)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encountered while bringing up pod %s: %w", podName, err)
 	}
@@ -591,7 +611,7 @@ func (ic *ContainerEngine) playKubeJob(ctx context.Context, jobYAML *v1.Job, opt
 	return &report, proxies, nil
 }
 
-func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podYAML *v1.PodTemplateSpec, options entities.PlayKubeOptions, ipIndex *int, annotations map[string]string, configMaps []v1.ConfigMap, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
+func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podYAML *v1.PodTemplateSpec, options entities.PlayKubeOptions, ipIndex *int, annotations map[string]string, configMaps []v1.ConfigMap, dm resource.DynamicResourcesManager, serviceContainer *libpod.Container) (*entities.PlayKubeReport, []*notifyproxy.NotifyProxy, error) {
 	cfg, err := ic.Libpod.GetConfigNoCopy()
 	if err != nil {
 		return nil, nil, err
@@ -917,6 +937,13 @@ func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podY
 		readOnly = types.NewOptionalBool(cfg.Containers.ReadOnly)
 	}
 
+	//dm.PrintState()
+
+	podResourceClaims := make(map[string]v1.PodResourceClaim)
+	for _, resourceClaim := range podYAML.Spec.ResourceClaims {
+		podResourceClaims[resourceClaim.Name] = resourceClaim
+	}
+
 	ctrNames := make(map[string]string)
 	for _, initCtr := range podYAML.Spec.InitContainers {
 		// Error out if same name is used for more than one container
@@ -953,6 +980,25 @@ func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podY
 			volumesFrom = list
 		}
 
+		containerDevices := make(map[string]bool, 0)
+		devices := make([]specs.LinuxDevice, 0)
+		for _, claim := range initCtr.Resources.Claims {
+			pc, ok := podResourceClaims[claim.Name]
+			if !ok {
+				return nil, nil, fmt.Errorf("the pod %q is invalid; init container made resource claim on non existent pod resource claim object", podName)
+			}
+			device, err := dm.ResolveK8sPodResourceClaimToDevice(&pc)
+			if err != nil {
+				return nil, nil, fmt.Errorf("the pod %q is invalid; init container made unresolvable resource claim: %s", podName, err)
+			}
+
+			// not sure if we should error out on duplicates, opting to make them unique instead
+			if _, ok := containerDevices[device]; !ok {
+				containerDevices[device] = true
+				devices = append(devices, specs.LinuxDevice{Path: device})
+			}
+		}
+
 		specgenOpts := kube.CtrSpecGenOptions{
 			Annotations:        annotations,
 			ConfigMaps:         configMaps,
@@ -981,6 +1027,8 @@ func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podY
 		if err != nil {
 			return nil, nil, err
 		}
+
+		specGen.Devices = append(specGen.Devices, devices...)
 
 		// ensure the environment is setup for initContainers as well: https://github.com/containers/podman/issues/18384
 		warn, err := generate.CompleteSpec(ctx, ic.Libpod, specGen)
@@ -1043,6 +1091,25 @@ func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podY
 			volumesFrom = list
 		}
 
+		containerDevices := make(map[string]bool, 0)
+		devices := make([]specs.LinuxDevice, 0)
+		for _, claim := range container.Resources.Claims {
+			pc, ok := podResourceClaims[claim.Name]
+			if !ok {
+				return nil, nil, fmt.Errorf("the pod %q is invalid; init container made resource claim on non existent pod resource claim object", podName)
+			}
+			device, err := dm.ResolveK8sPodResourceClaimToDevice(&pc)
+			if err != nil {
+				return nil, nil, fmt.Errorf("the pod %q is invalid; init container made unresolvable resource claim: %s", podName, err)
+			}
+
+			// not sure if we should error out on duplicates, opting to make them unique instead
+			if _, ok := containerDevices[device]; !ok {
+				containerDevices[device] = true
+				devices = append(devices, specs.LinuxDevice{Path: device})
+			}
+		}
+
 		specgenOpts := kube.CtrSpecGenOptions{
 			Annotations:        annotations,
 			ConfigMaps:         configMaps,
@@ -1077,6 +1144,8 @@ func (ic *ContainerEngine) playKubePod(ctx context.Context, podName string, podY
 		if err != nil {
 			return nil, nil, err
 		}
+
+		specGen.Devices = append(specGen.Devices, devices...)
 
 		// Make sure to complete the spec (#17016)
 		warn, err := generate.CompleteSpec(ctx, ic.Libpod, specGen)
